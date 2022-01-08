@@ -62,6 +62,7 @@ function grpc.each_method(fname, f, recurse)
   p:addpath("kong")
   p:addpath("kong/include")
   p:addpath("spec/fixtures/grpc")
+  p:addpath("../koko/internal/wrpc/proto")    -- find a real place to put these
 
   p.include_imports = true
   p:addpath(dir)
