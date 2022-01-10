@@ -1,64 +1,66 @@
-local protoc = require "protoc"
 local pb = require "pb"
 local grpc = require "kong.tools.grpc"
 
-local pp = require "pl.pretty"
+local encode = pb.encode
+local decode = pb.decode
+local send = nil
+local receive = nil
 
 local wrpc = {}
 
 local _service_cache = {}
+local _all_services = {}
 
 local function proto_searchpath(name)
-  return package.searchpath(name, "/usr/include/?.proto;/home/javier/devel/kong_dev/koko/internal/wrpc/proto/?.proto")
+  return package.searchpath(name, "/usr/include/?.proto;../koko/internal/wrpc/proto/?.proto")
 end
 
-local function protobuf_parse(fname)
-  local p = protoc.new()
-  p:addpath("/usr/include")
-  p:addpath("/home/javier/devel/kong_dev/koko/internal/wrpc/proto")
-  p.include_imports = true
-  p:loadfile(fname)
-  return p:parsefile(fname)
+--- injects dependencies
+function wrpc.inject(opts)
+  encode = opts.encode or encode
+  decode = opts.decode or decode
+  send = opts.send or send
+  receive = opts.receive or receive
 end
-
-
-local function merge(dst, src)
-  for k, v in pairs(src) do
-    dst[k] = v
-  end
-  return dst
-end
-
-local function add_meta(target, datas)
-  target.wrpc = merge(target.wrpc or {}, datas[target.name] or {})
-end
-
 
 --- loads a service from a .proto file
---- including wrpc annotations
+--- returns a table relating the wRPC ids with
+--- the scoped names and types
 function wrpc.load_service(service_name)
-  local service = _service_cache[service_name]
-  if service ~= nil then
-    return service
+  do
+    local service = _service_cache[service_name]
+    if service ~= nil then
+      return service
+    end
   end
 
-  local service_fname = assert(proto_searchpath(service_name))
-  local proto_f = assert(io.open(service_fname))
   local annotations = {
     service = {},
     rpc = {},
   }
-  for line in proto_f:lines() do -- io.lines(service_fname) do
+  local service_fname = assert(proto_searchpath(service_name))
+  local proto_f = assert(io.open(service_fname))
+  local scope_name = nil
+
+  for line in proto_f:lines() do
     local annotation = line:match("//%s*%+wrpc:%s*(.-)%s*$")
     if annotation then
       local nextline = proto_f:read("*l")
       local keyword, identifier = nextline:match("^%s*(%a+)%s+(%w+)")
       if keyword and identifier then
+
+        if keyword == "service" then
+          scope_name = identifier;
+
+        elseif keyword == "rpc" then
+          identifier = scope_name .. "." .. identifier
+        end
+
         local type_annotations = annotations[keyword]
         if type_annotations then
           local tag_key, tag_value = annotation:match("^%s*(%S-)=(%S+)%s*$")
           if tag_key and tag_value then
-            tag_value = tonumber(tag_value) or tag_value
+            tag_value = tag_value
             local tags = type_annotations[identifier] or {}
             type_annotations[identifier] = tags
             tags[tag_key] = tag_value
@@ -69,14 +71,95 @@ function wrpc.load_service(service_name)
   end
   proto_f:close()
 
-  service = grpc.each_method(service_fname, function(parsed, srvc, mthd)
-    add_meta(srvc, annotations.service)
-    add_meta(mthd, annotations.rpc)
+  local service = {}
+  grpc.each_method(service_fname, function(parsed, srvc, mthd)
+    assert(srvc.name)
+    assert(mthd.name)
+    local rpc_name = srvc.name .. "." .. mthd.name
+
+    local service_id = assert(annotations.service[srvc.name] and annotations.service[srvc.name]["service-id"])
+    local rpc_id = assert(annotations.rpc[rpc_name] and annotations.rpc[rpc_name]["rpc-id"])
+    local rpc = {
+      name = rpc_name,
+      service_id = service_id,
+      rpc_id = rpc_id,
+      input_type = mthd.input_type,
+      output_type = mthd.output_type,
+    }
+    service[service_id .. ":" .. rpc_id] = rpc
+    service[rpc_name] = rpc
+    _all_services[service_id .. ":" .. rpc_id] = rpc
+    _all_services[rpc_name] = rpc
   end, true)
 
   _service_cache[service_name] = service
-
   return service
+end
+
+local seq = 0
+function wrpc.call(name, data)
+  seq = seq + 1
+
+  local rpc = _all_services[name]
+
+  local msg = encode("WebsocketPayload", {
+    version = 1,
+    payload = encode(rpc.input_type, data),
+  })
+  send(msg)
+  return seq
+end
+
+
+local function decode_payload(payload)
+  local id = (payload.svc_id or "") .. ":" .. (payload.rpc_id or "")
+  local rpc = _all_services[id]
+  if not rpc then
+    return nil, "INVALID_SERVICE"
+  end
+
+  local out = {
+    seq = payload.seq,
+    ack = payload.ack,
+    deadline = payload.deadline,
+    method_name = rpc.name,
+    data = decode(rpc.output_type, payload.payloads),
+  }
+
+  return out
+end
+
+local _response_queue = {}
+
+function wrpc.step()
+  local msg = receive()
+
+  while msg ~= nil do
+    msg = assert(decode("WebsocketPayload", msg))
+    assert(msg.version == 1, "unknown encoding version")
+    local payload = msg.payload
+    if payload.mtype == 2 then
+      -- MESSAGE_TYPE_RPC
+      -- handle "protocol" stuff (deadline, encoding, versions, etc
+      _response_queue[payload.ack] = assert(decode_payload(payload)).data
+
+    end
+
+    msg = receive()
+  end
+end
+
+function wrpc.get_response(req_id)
+  wrpc.step()
+
+  local resp_data = _response_queue[req_id]
+  _response_queue[req_id] = nil
+
+  if resp_data == nil then
+    return nil, "no response"
+  end
+
+  return resp_data
 end
 
 
