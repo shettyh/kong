@@ -11,8 +11,10 @@ local wrpc = {}
 local _service_cache = {}
 local _all_services = {}
 
+local pp = require "pl.pretty".debug
+
 local function proto_searchpath(name)
-  return package.searchpath(name, "/usr/include/?.proto;../koko/internal/wrpc/proto/?.proto")
+  return package.searchpath(name, "/usr/include/?.proto;../koko/internal/wrpc/proto/?.proto;../go-wrpc/wrpc/internal/wrpc/?.proto")
 end
 
 --- injects dependencies
@@ -23,6 +25,8 @@ function wrpc.inject(opts)
   receive = opts.receive or receive
 end
 
+local wrpc_proto
+
 --- loads a service from a .proto file
 --- returns a table relating the wRPC ids with
 --- the scoped names and types
@@ -32,6 +36,12 @@ function wrpc.load_service(service_name)
     if service ~= nil then
       return service
     end
+  end
+
+  if not wrpc_proto then
+    local wrpc_protofname = assert(proto_searchpath("wrpc"))
+    wrpc_proto = assert(grpc.each_method(wrpc_protofname))
+    pp("wrpc_proto", wrpc_proto)
   end
 
   local annotations = {
@@ -102,9 +112,17 @@ function wrpc.call(name, data)
 
   local rpc = _all_services[name]
 
-  local msg = encode("WebsocketPayload", {
+  local msg = encode("wrpc.WebsocketPayload", {
     version = 1,
-    payload = encode(rpc.input_type, data),
+    payload = {
+      mtype = 2, -- MESSAGE_TYPE_RPC,
+      svc_id = rpc.service_id,
+      rpc_id = rpc.rpc_id,
+      seq = seq,
+      deadline = ngx.now() + 10,
+      payload_encoding = 1, -- ENCODING_PROTO3
+      payloads = { encode(rpc.input_type, data), }
+    },
   })
   send(msg)
   return seq
