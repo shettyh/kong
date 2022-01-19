@@ -77,13 +77,29 @@ describe("wRPC tools", function()
     local call_id = assert.not_nil(wrpc.call("ConfigService.SyncConfig", req_data))
 
     assert.same({type = ".kong.services.config.v1.SyncConfigRequest", data = req_data}, mock_buff_pop("encode"))
-    assert.same({type = "WebsocketPayload", data = {
+    assert.same({type = "wrpc.WebsocketPayload", data = {
       version = 1,
-      payload = req_data,
+      payload = {
+        svc_id = 1,
+        rpc_id = 2,
+        seq = 1,
+        mtype = 2,
+        deadline = ngx.now() + 10,
+        payload_encoding = 1,
+        payloads = { req_data },
+      },
     }}, mock_buff_pop("encode"))
     assert.same({
       version = 1,
-      payload = req_data,
+      payload = {
+        svc_id = 1,
+        rpc_id = 2,
+        seq = 1,
+        mtype = 2,
+        deadline = ngx.now() + 10,
+        payload_encoding = 1,
+        payloads = { req_data },
+      },
     }, mock_buff_pop("send"))
 
     local response, err = wrpc.get_response(call_id)

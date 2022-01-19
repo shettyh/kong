@@ -1,6 +1,8 @@
 local pb = require "pb"
 local grpc = require "kong.tools.grpc"
 
+local exiting = ngx.worker.exiting
+
 local encode = pb.encode
 local decode = pb.decode
 local send = nil
@@ -41,7 +43,7 @@ function wrpc.load_service(service_name)
   if not wrpc_proto then
     local wrpc_protofname = assert(proto_searchpath("wrpc"))
     wrpc_proto = assert(grpc.each_method(wrpc_protofname))
-    pp("wrpc_proto", wrpc_proto)
+    --pp("wrpc_proto", wrpc_proto)
   end
 
   local annotations = {
@@ -91,8 +93,8 @@ function wrpc.load_service(service_name)
     local rpc_id = assert(annotations.rpc[rpc_name] and annotations.rpc[rpc_name]["rpc-id"])
     local rpc = {
       name = rpc_name,
-      service_id = service_id,
-      rpc_id = rpc_id,
+      service_id = tonumber(service_id),
+      rpc_id = tonumber(rpc_id),
       input_type = mthd.input_type,
       output_type = mthd.output_type,
     }
@@ -153,7 +155,7 @@ function wrpc.step()
   local msg = receive()
 
   while msg ~= nil do
-    msg = assert(decode("WebsocketPayload", msg))
+    msg = assert(decode("wrpc.WebsocketPayload", msg))
     assert(msg.version == 1, "unknown encoding version")
     local payload = msg.payload
     if payload.mtype == 2 then
@@ -165,6 +167,14 @@ function wrpc.step()
 
     msg = receive()
   end
+end
+
+function wrpc.receive_thread()
+  return ngx.thread.spawn(function()
+    while not exiting() do
+      wrpc.step()
+    end
+  end)
 end
 
 function wrpc.get_response(req_id)
