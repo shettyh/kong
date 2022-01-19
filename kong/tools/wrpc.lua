@@ -9,9 +9,12 @@ local pp = require "pl.pretty".debug
 
 
 local function merge(a, b)
-  for k, v in pairs(b) do
-    a[k] = v
+  if type(b) == "table" then
+    for k, v in pairs(b) do
+      a[k] = v
+    end
   end
+
   return a
 end
 

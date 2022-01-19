@@ -182,8 +182,8 @@ function _M:init_worker()
 end
 
 
-local function send_ping(c, log_suffix)
-  local seq = wrpc.call("ConfigService.PingCP", {})
+local function send_ping(peer, log_suffix)
+  local seq = peer:call("ConfigService.PingCP", {})
   ngx_log(ngx_DEBUG, _log_prefix, "sent ping", log_suffix)
   --log_suffix = log_suffix or ""
   --
@@ -203,9 +203,13 @@ local function send_ping(c, log_suffix)
   --end
 end
 
+local wrpc_config_service
 
 function _M:communicate(premature)
-  assert(wrpc.load_service("kong.services.config.v1.config"))
+  if not wrpc_config_service then
+    wrpc_config_service = wrpc.new_service()
+    wrpc_config_service:add("kong.services.config.v1.config")
+  end
 
   if premature then
     -- worker wants to exit
@@ -250,16 +254,9 @@ function _M:communicate(premature)
     return
   end
 
-  wrpc.inject{
-    send = function(d) c:send_binary(d) end,
-    receive = function()
-      while true do
-        local data, typ, err = c:recv_frame()
-        if not data then return nil, err end
-        if typ == "binary" then return data end
-      end
-    end,
-  }
+  local peer = wrpc.new_peer(c, wrpc_config_service)
+
+  peer:call("ConfigService.ReportBasicInfo", { plugins = self.plugins_list })
 
   -- connection established
   -- first, send out the plugin list to CP so it can make decision on whether
@@ -332,7 +329,7 @@ function _M:communicate(premature)
 
   local write_thread = ngx.thread.spawn(function()
     while not exiting() do
-      send_ping(c, log_suffix)
+      send_ping(peer, log_suffix)
 
       for _ = 1, PING_INTERVAL do
         ngx_sleep(1)
