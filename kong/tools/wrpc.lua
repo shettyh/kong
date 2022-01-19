@@ -3,49 +3,43 @@ local grpc = require "kong.tools.grpc"
 
 local exiting = ngx.worker.exiting
 
-local encode = pb.encode
-local decode = pb.decode
-local send = nil
-local receive = nil
-
 local wrpc = {}
 
-local _service_cache = {}
-local _all_services = {}
-
 local pp = require "pl.pretty".debug
+
+
+local function merge(a, b)
+  for k, v in pairs(b) do
+    a[k] = v
+  end
+  return a
+end
 
 local function proto_searchpath(name)
   return package.searchpath(name, "/usr/include/?.proto;../koko/internal/wrpc/proto/?.proto;../go-wrpc/wrpc/internal/wrpc/?.proto")
 end
 
---- injects dependencies
-function wrpc.inject(opts)
-  encode = opts.encode or encode
-  decode = opts.decode or decode
-  send = opts.send or send
-  receive = opts.receive or receive
-end
-
 local wrpc_proto
 
---- loads a service from a .proto file
---- returns a table relating the wRPC ids with
---- the scoped names and types
-function wrpc.load_service(service_name)
-  do
-    local service = _service_cache[service_name]
-    if service ~= nil then
-      return service
-    end
-  end
+local wrpc_service = {}
+wrpc_service.__index = wrpc_service
 
+
+
+function wrpc.new_service()
   if not wrpc_proto then
     local wrpc_protofname = assert(proto_searchpath("wrpc"))
     wrpc_proto = assert(grpc.each_method(wrpc_protofname))
     --pp("wrpc_proto", wrpc_proto)
   end
 
+  return setmetatable({
+    methods = {},
+  }, wrpc_service)
+end
+
+
+function wrpc_service:add(service_name)
   local annotations = {
     service = {},
     rpc = {},
@@ -83,7 +77,6 @@ function wrpc.load_service(service_name)
   end
   proto_f:close()
 
-  local service = {}
   grpc.each_method(service_fname, function(parsed, srvc, mthd)
     assert(srvc.name)
     assert(mthd.name)
@@ -98,23 +91,66 @@ function wrpc.load_service(service_name)
       input_type = mthd.input_type,
       output_type = mthd.output_type,
     }
-    service[service_id .. ":" .. rpc_id] = rpc
-    service[rpc_name] = rpc
-    _all_services[service_id .. ":" .. rpc_id] = rpc
-    _all_services[rpc_name] = rpc
+    self.methods[service_id .. ":" .. rpc_id] = rpc
+    self.methods[rpc_name] = rpc
   end, true)
-
-  _service_cache[service_name] = service
-  return service
 end
 
-local seq = 0
-function wrpc.call(name, data)
-  seq = seq + 1
 
-  local rpc = _all_services[name]
+function wrpc_service:get_method(srvc_id, rpc_id)
+  local rpc_name
+  if type(srvc_id) == "string" and rpc_id == nil then
+    rpc_name = srvc_id
+  else
+    rpc_name = tostring(srvc_id) .. ":" .. tostring(rpc_id)
+  end
 
-  local msg = encode("wrpc.WebsocketPayload", {
+  return self.methods[rpc_name]
+end
+
+
+local wrpc_peer = {
+  encode = pb.encode,
+  decode = pb.decode,
+}
+wrpc_peer.__index = wrpc_peer
+
+function wrpc.new_peer(conn, service, opts)
+  return setmetatable(merge({
+    conn = conn,
+    service = service,
+    seq = 0,
+    response_queue = {},
+  }, opts), wrpc_peer)
+end
+
+
+function wrpc_peer:send(d)
+  self.conn:send_binary(d)
+end
+
+function wrpc_peer:receive()
+  while true do
+    local data, typ, err = self.conn:recv_frame()
+    if not data then
+      return nil, err
+    end
+
+    if typ == "binary" then
+      return data
+    end
+  end
+end
+
+function wrpc_peer:call(name, data)
+  local seq = self.seq + 1
+
+  local rpc = self.service:get_method(name)
+  if not rpc then
+    return nil, string.format("no method %q", name)
+  end
+
+  local msg = self.encode("wrpc.WebsocketPayload", {
     version = 1,
     payload = {
       mtype = 2, -- MESSAGE_TYPE_RPC,
@@ -123,17 +159,17 @@ function wrpc.call(name, data)
       seq = seq,
       deadline = ngx.now() + 10,
       payload_encoding = 1, -- ENCODING_PROTO3
-      payloads = { encode(rpc.input_type, data), }
+      payloads = { self.encode(rpc.input_type, data), }
     },
   })
-  send(msg)
+  self:send(msg)
+  self.seq = seq
   return seq
 end
 
 
-local function decode_payload(payload)
-  local id = (payload.svc_id or "") .. ":" .. (payload.rpc_id or "")
-  local rpc = _all_services[id]
+local function decode_payload(self, payload)
+  local rpc = self.service:get_method(payload.svc_id, payload.rpc_id)
   if not rpc then
     return nil, "INVALID_SERVICE"
   end
@@ -143,45 +179,46 @@ local function decode_payload(payload)
     ack = payload.ack,
     deadline = payload.deadline,
     method_name = rpc.name,
-    data = decode(rpc.output_type, payload.payloads),
+    data = self.decode(rpc.output_type, payload.payloads),
   }
 
   return out
 end
 
-local _response_queue = {}
 
-function wrpc.step()
-  local msg = receive()
+function wrpc_peer:step()
+  local msg = self:receive()
 
   while msg ~= nil do
-    msg = assert(decode("wrpc.WebsocketPayload", msg))
+    msg = assert(self.decode("wrpc.WebsocketPayload", msg))
     assert(msg.version == 1, "unknown encoding version")
     local payload = msg.payload
     if payload.mtype == 2 then
       -- MESSAGE_TYPE_RPC
       -- handle "protocol" stuff (deadline, encoding, versions, etc
-      _response_queue[payload.ack] = assert(decode_payload(payload)).data
+      self.response_queue[payload.ack] = assert(decode_payload(self, payload)).data
 
     end
 
-    msg = receive()
+    msg = self:receive()
   end
 end
 
-function wrpc.receive_thread()
+function wrpc_peer:receive_thread()
   return ngx.thread.spawn(function()
     while not exiting() do
-      wrpc.step()
+      self:step()
     end
   end)
 end
 
-function wrpc.get_response(req_id)
-  wrpc.step()
 
-  local resp_data = _response_queue[req_id]
-  _response_queue[req_id] = nil
+
+function wrpc_peer:get_response(req_id)
+  self:step()
+
+  local resp_data = self.response_queue[req_id]
+  self.response_queue[req_id] = nil
 
   if resp_data == nil then
     return nil, "no response"

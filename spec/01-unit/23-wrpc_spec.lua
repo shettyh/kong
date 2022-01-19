@@ -35,7 +35,7 @@ local function mock_decode(type, d)
   return d
 end
 
-local function mock_send(d)
+local function mock_send(_, d)
   return mock_buffer_add("send", d)
 end
 
@@ -46,26 +46,28 @@ end
 
 describe("wRPC tools", function()
   it("loads service definition", function()
-    local srv = wrpc.load_service("kong.services.config.v1.config")
+    local srv = wrpc.new_service()
+    srv:add("kong.services.config.v1.config")
 
-    local ping_method = srv["ConfigService.PingCP"]
+    local ping_method = srv:get_method("ConfigService.PingCP")
+
     assert.is_table(ping_method)
     assert.same("ConfigService.PingCP", ping_method.name)
     assert.is_string(ping_method.input_type)
     assert.is_string(ping_method.output_type)
-    local method_ref = ping_method.service_id .. ":" .. ping_method.rpc_id
-    assert.equals(srv[method_ref], ping_method)
+    --assert.equals(srv.service_id, ping_method.service_id)
+    assert.equals(srv:get_method(ping_method.service_id, ping_method.rpc_id), ping_method)
   end)
 
   it("rpc call", function()
-    wrpc.inject{
+    local srv = wrpc.new_service()
+    srv:add("kong.services.config.v1.config")
+    local peer = wrpc.new_peer(nil, srv, {
       encode = mock_encode,
       decode = mock_decode,
       send = mock_send,
       receive = mock_receive,
-    }
-
-    wrpc.load_service("kong.services.config.v1.config")
+    })
 
     clear_mock_buffers()
     local req_data = {
@@ -74,7 +76,7 @@ describe("wRPC tools", function()
         format_version = "0.1a",
       }
     }
-    local call_id = assert.not_nil(wrpc.call("ConfigService.SyncConfig", req_data))
+    local call_id = assert.not_nil(peer:call("ConfigService.SyncConfig", req_data))
 
     assert.same({type = ".kong.services.config.v1.SyncConfigRequest", data = req_data}, mock_buff_pop("encode"))
     assert.same({type = "wrpc.WebsocketPayload", data = {
@@ -102,7 +104,7 @@ describe("wRPC tools", function()
       },
     }, mock_buff_pop("send"))
 
-    local response, err = wrpc.get_response(call_id)
+    local response, err = peer:get_response(call_id)
     assert.is_nil(response)
     assert.equal("no response", err)
 
@@ -119,7 +121,7 @@ describe("wRPC tools", function()
         payloads = { accepted = true }
       }
     })
-    response, err = wrpc.get_response(call_id)
+    response, err = peer:get_response(call_id)
     assert.is_nil(err)
     assert.same({ accepted = true }, response)
 
