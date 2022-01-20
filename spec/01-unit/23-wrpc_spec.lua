@@ -22,6 +22,7 @@ local function mock_buff_pop(bufname)
     return d
   end
 
+  ngx.sleep(0)
   return nil, "empty"
 end
 
@@ -60,15 +61,6 @@ describe("wRPC tools", function()
   end)
 
   it("rpc call", function()
-    local srv = wrpc.new_service()
-    srv:add("kong.services.config.v1.config")
-    local peer = wrpc.new_peer(nil, srv, {
-      encode = mock_encode,
-      decode = mock_decode,
-      send = mock_send,
-      receive = mock_receive,
-    })
-
     clear_mock_buffers()
     local req_data = {
       version = 2,
@@ -76,6 +68,16 @@ describe("wRPC tools", function()
         format_version = "0.1a",
       }
     }
+
+    local srv = wrpc.new_service()
+    srv:add("kong.services.config.v1.config")
+    local peer = wrpc.new_peer(nil, srv, {
+    encode = mock_encode,
+    decode = mock_decode,
+    send = mock_send,
+    receive = mock_receive,
+    })
+
     local call_id = assert.not_nil(peer:call("ConfigService.SyncConfig", req_data))
 
     assert.same({type = ".kong.services.config.v1.SyncConfigRequest", data = req_data}, mock_buff_pop("encode"))
@@ -104,6 +106,7 @@ describe("wRPC tools", function()
       },
     }, mock_buff_pop("send"))
 
+    peer:step()
     local response, err = peer:get_response(call_id)
     assert.is_nil(response)
     assert.equal("no response", err)
@@ -121,6 +124,7 @@ describe("wRPC tools", function()
         payloads = { accepted = true }
       }
     })
+    peer:step()
     response, err = peer:get_response(call_id)
     assert.is_nil(err)
     assert.same({ accepted = true }, response)

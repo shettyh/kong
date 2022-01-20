@@ -1,5 +1,9 @@
 local pb = require "pb"
 local grpc = require "kong.tools.grpc"
+require "table.new"
+
+local select = select
+local table_unpack = table.unpack
 
 local exiting = ngx.worker.exiting
 
@@ -22,13 +26,16 @@ local function proto_searchpath(name)
   return package.searchpath(name, "/usr/include/?.proto;../koko/internal/wrpc/proto/?.proto;../go-wrpc/wrpc/internal/wrpc/?.proto")
 end
 
+--- definitions for the transport protocol
 local wrpc_proto
+
 
 local wrpc_service = {}
 wrpc_service.__index = wrpc_service
 
 
-
+--- a `service` object holds a set of methods defined
+--- in .proto files
 function wrpc.new_service()
   if not wrpc_proto then
     local wrpc_protofname = assert(proto_searchpath("wrpc"))
@@ -41,7 +48,9 @@ function wrpc.new_service()
   }, wrpc_service)
 end
 
-
+--- Loads the methods from a .proto file.
+--- There can be more than one file, and any number of
+--- service definitions.
 function wrpc_service:add(service_name)
   local annotations = {
     service = {},
@@ -99,7 +108,9 @@ function wrpc_service:add(service_name)
   end, true)
 end
 
-
+--- returns the method defintion given either:
+--- pair of IDs (service, rpc) or
+--- rpc name as "<service_name>.<rpc_name>"
 function wrpc_service:get_method(srvc_id, rpc_id)
   local rpc_name
   if type(srvc_id) == "string" and rpc_id == nil then
@@ -111,6 +122,19 @@ function wrpc_service:get_method(srvc_id, rpc_id)
   return self.methods[rpc_name]
 end
 
+--- sets a service handler for the givern rpc method
+--- @param rpc_name string Full name of the rpc method
+--- @param handler function Function called to handle the rpc method.
+function wrpc_service:set_handler(rpc_name, handler)
+  local rpc = self:get_method(rpc_name)
+  if not rpc then
+    return nil, string.format("unknown method %q", rpc_name)
+  end
+
+  rpc.handler = handler
+  return rpc
+end
+
 
 local wrpc_peer = {
   encode = pb.encode,
@@ -118,13 +142,25 @@ local wrpc_peer = {
 }
 wrpc_peer.__index = wrpc_peer
 
+--- a `peer` object holds a (websocket) connection and a service.
 function wrpc.new_peer(conn, service, opts)
   return setmetatable(merge({
     conn = conn,
     service = service,
     seq = 0,
     response_queue = {},
+    closing = false,
+    _receiving_thread = nil,
   }, opts), wrpc_peer)
+end
+
+
+function wrpc_peer:close()
+  self.closing = true
+  if self._receiving_thread then
+    ngx.thread.wait(self._receiving_thread)
+  end
+  self.conn:close()
 end
 
 
@@ -133,59 +169,124 @@ function wrpc_peer:send(d)
 end
 
 function wrpc_peer:receive()
+  --print("------------- wrpc_peer:receive()")
   while true do
     local data, typ, err = self.conn:recv_frame()
+    --print(string.format("data: %q, typ: %q, err: %q", data, typ, err))
     if not data then
+      --print("no data!")
       return nil, err
     end
 
     if typ == "binary" then
+      --print("returning data")
       return data
     end
+
+    if typ == "close" then
+      --print("close frame")
+      kong.log.notice("Received WebSocket \"close\" frame from peer")
+      return self:close()
+    end
+    --print("going round...")
   end
 end
 
-function wrpc_peer:call(name, data)
-  local seq = self.seq + 1
-
+--- RPC call.
+--- returns the call sequence number, doesn't wait for response.
+function wrpc_peer:call(name, ...)
   local rpc = self.service:get_method(name)
   if not rpc then
     return nil, string.format("no method %q", name)
   end
 
-  local msg = self.encode("wrpc.WebsocketPayload", {
-    version = 1,
-    payload = {
-      mtype = 2, -- MESSAGE_TYPE_RPC,
-      svc_id = rpc.service_id,
-      rpc_id = rpc.rpc_id,
-      seq = seq,
-      deadline = ngx.now() + 10,
-      payload_encoding = 1, -- ENCODING_PROTO3
-      payloads = { self.encode(rpc.input_type, data), }
-    },
+  local num_args = select('#', ...)
+  local payloads = table.new(num_args, 0)
+  for i = 1, num_args do
+    payloads[i] = self.encode(rpc.input_type, select(i, ...))
+  end
+
+  self:send_payload({
+    mtype = 2, -- MESSAGE_TYPE_RPC,
+    svc_id = rpc.service_id,
+    rpc_id = rpc.rpc_id,
+    payload_encoding = "ENCODING_PROTO3",
+    payloads = payloads,
   })
-  self:send(msg)
-  self.seq = seq
-  return seq
+  return self.seq
+end
+
+--- little helper to ease grabbing an unspecified number of
+local function ok_wrapper(ok, ...)
+  return ok, {n = select('#', ...), ...}
+end
+
+local function decodearray(decode, typ, l)
+  local out = {}
+  for i, v in ipairs(l) do
+    out[i] = decode(typ, v)
+  end
+  return out
 end
 
 
-local function decode_payload(self, payload)
+function wrpc_peer:send_payload(payload)
+  local seq = self.seq + 1
+  payload.seq = seq
+  payload.deadline = ngx.now() + 10,
+
+  self:send(self.encode("wrpc.WebsocketPayload",{
+    version = "PAYLOAD_VERSION_V1",
+    payload = payload,
+  }))
+  self.seq = seq
+end
+
+
+--- Handle RPC data (mtype == MESSAGE_TYPE_RPC).
+--- Could be an incoming method call or the response to a previous one.
+--- @param payload table decoded payload field from incoming `wrpc.WebsocketPayload` message
+function wrpc_peer:handle(payload)
   local rpc = self.service:get_method(payload.svc_id, payload.rpc_id)
   if not rpc then
-    return nil, "INVALID_SERVICE"
+    self:send_payload({
+      mtype = "MESSAGE_TYPE_ERROR",
+      error = {
+        etype = "ERROR_TYPE_INVALID_SERVICE",
+        description = "Invalid service (or rpc)",
+      },
+      srvc_id = payload.svc_id,
+      rpc_id = payload.rpc_id,
+      ack = payload.seq,
+    })
+    return nil, "INVALID_SERVICE"  -- TODO: send to peer
   end
 
-  local out = {
-    seq = payload.seq,
-    ack = payload.ack,
-    deadline = payload.deadline,
-    method_name = rpc.name,
-    data = self.decode(rpc.output_type, payload.payloads),
-  }
+  local data_type
+  local ack = tonumber(payload.ack) or 0
+  if ack > 0 then
+    -- response to a previous call
+    self.response_queue[ack] = decodearray(self.decode, rpc.output_type, payload.payloads)
+    pp("response:", ack, self.response_queue[ack])
 
-  return out
+  else
+    -- incoming method call
+    if rpc.handler then
+      local input_data = decodearray(self.decode, rpc.input_type, payload.payloads)
+      local ok, output_data = ok_wrapper(pcall(rpc.handler, table_unpack(input_data, 1, input_data.n)))
+      if not ok then
+        return nil, output_data   -- TODO: send error to peer
+      end
+      self:send_payload({
+        mtype = "MESSAGE_TYPE_RPC", -- MESSAGE_TYPE_RPC,
+        svc_id = rpc.service_id,
+        rpc_id = rpc.rpc_id,
+        ack = payload.seq,
+        payload_encoding = "ENCODING_PROTO3",
+        payloads = { self.encode(rpc.output_type, output_data), },
+      })
+    end
+  end
 end
 
 
@@ -194,13 +295,16 @@ function wrpc_peer:step()
 
   while msg ~= nil do
     msg = assert(self.decode("wrpc.WebsocketPayload", msg))
-    assert(msg.version == 1, "unknown encoding version")
+    --pp("step, decoded msg:", msg)
+    assert(msg.version == "PAYLOAD_VERSION_V1", "unknown encoding version")
     local payload = msg.payload
-    if payload.mtype == 2 then
-      -- MESSAGE_TYPE_RPC
-      -- handle "protocol" stuff (deadline, encoding, versions, etc
-      self.response_queue[payload.ack] = assert(decode_payload(self, payload)).data
 
+    if payload.mtype == "MESSAGE_TYPE_ERROR" then
+      -- TODO: send error to waiting call (if any)
+
+    elseif payload.mtype == "MESSAGE_TYPE_RPC" then
+      -- handle "protocol" stuff (deadline, encoding, versions, etc
+      self:handle(payload)
     end
 
     msg = self:receive()
@@ -208,18 +312,17 @@ function wrpc_peer:step()
 end
 
 function wrpc_peer:receive_thread()
-  return ngx.thread.spawn(function()
-    while not exiting() do
+  self._receiving_thread = assert(ngx.thread.spawn(function()
+    while not exiting() and not self.closing do
       self:step()
+      ngx.sleep(1)
     end
-  end)
+  end))
 end
 
 
-
+--- Returns the response for a given call ID, if any
 function wrpc_peer:get_response(req_id)
-  self:step()
-
   local resp_data = self.response_queue[req_id]
   self.response_queue[req_id] = nil
 
