@@ -562,49 +562,24 @@ function _M:handle_cp_websocket()
   end
 
   -- connection established
-  local update_sync_status
+  local basic_info
+  local basic_info_semaphore = semaphore.new()
 
   if not wrpc_config_service then
     wrpc_config_service = wrpc.new_service()
     wrpc_config_service:add("kong.services.config.v1.config")
-    wrpc_config_service:set_handler("ConfigService.ReportBasicInfo", function(basic_info)
-      basic_info = basic_info
-      require "pl.pretty".debug("basic_info:", basic_info)
-
-      local dp_plugins_map = plugins_list_to_map(basic_info.plugins)
-      local config_hash = string.rep("0", 32) -- initial hash
-      local last_seen = ngx_time()
-      local sync_status = CLUSTERING_SYNC_STATUS.UNKNOWN
-      local purge_delay = self.conf.cluster_data_plane_purge_delay
-      update_sync_status = function()
-        local ok; ok, err = kong.db.clustering_data_planes:upsert({ id = dp_id, }, {
-          last_seen = last_seen,
-          config_hash = config_hash ~= "" and config_hash or nil,
-          hostname = dp_hostname,
-          ip = dp_ip,
-          version = dp_version,
-          sync_status = sync_status, -- TODO: import may have been failed though
-        }, { ttl = purge_delay })
-        if not ok then
-          ngx_log(ngx_ERR, _log_prefix, "unable to update clustering data plane status: ", err, log_suffix)
-        end
-      end
-
-      _, err, sync_status = self:check_version_compatibility(dp_version, dp_plugins_map, log_suffix)
-      if err then
-        ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
-        wb:send_close()
-        update_sync_status()
-        --return ngx_exit(ngx_CLOSE)
-      end
+    wrpc_config_service:set_handler("ConfigService.ReportBasicInfo", function(data)
+      ngx_log(ngx_DEBUG, _log_prefix, "received basic_info", log_suffix)
+      basic_info = data
+      basic_info_semaphore:post()
     end)
   end
   local w_peer = wrpc.new_peer(wb, wrpc_config_service)
   w_peer:receive_thread()
-  ngx.thread.wait(w_peer._receiving_thread)
-  do return ngx_exit(ngx_CLOSE) end
+  --ngx.thread.wait(w_peer._receiving_thread)
+  --do return ngx_exit(ngx_CLOSE) end
 
-  ---- receive basic info
+  -- receive basic info
   --local data, typ
   --data, typ, err = wb:recv_frame()
   --if err then
@@ -636,38 +611,46 @@ function _M:handle_cp_websocket()
   --  end
   --end
 
-  --if err then
-  --  ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
-  --  wb:send_close()
-  --  return ngx_exit(ngx_CLOSE)
-  --end
-  --
-  --local dp_plugins_map = plugins_list_to_map(data.plugins)
-  --local config_hash = string.rep("0", 32) -- initial hash
-  --local last_seen = ngx_time()
-  --local sync_status = CLUSTERING_SYNC_STATUS.UNKNOWN
-  --local purge_delay = self.conf.cluster_data_plane_purge_delay
-  --local update_sync_status = function()
-  --  local ok, err = kong.db.clustering_data_planes:upsert({ id = dp_id, }, {
-  --    last_seen = last_seen,
-  --    config_hash = config_hash ~= "" and config_hash or nil,
-  --    hostname = dp_hostname,
-  --    ip = dp_ip,
-  --    version = dp_version,
-  --    sync_status = sync_status, -- TODO: import may have been failed though
-  --  }, { ttl = purge_delay })
-  --  if not ok then
-  --    ngx_log(ngx_ERR, _log_prefix, "unable to update clustering data plane status: ", err, log_suffix)
-  --  end
-  --end
+  local ok, err = basic_info_semaphore:wait(5)
+  if not ok then
+    err = "waiting for basic info call: " .. (err or "--")
+  end
+  if not basic_info then
+    err = "invalid basic_info data"
+  end
 
-  --_, err, sync_status = self:check_version_compatibility(dp_version, dp_plugins_map, log_suffix)
-  --if err then
-  --  ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
-  --  wb:send_close()
-  --  update_sync_status()
-  --  return ngx_exit(ngx_CLOSE)
-  --end
+  if err then
+    ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
+    wb:send_close()
+    return ngx_exit(ngx_CLOSE)
+  end
+
+  local dp_plugins_map = plugins_list_to_map(basic_info.plugins)
+  local config_hash = string.rep("0", 32) -- initial hash
+  local last_seen = ngx_time()
+  local sync_status = CLUSTERING_SYNC_STATUS.UNKNOWN
+  local purge_delay = self.conf.cluster_data_plane_purge_delay
+  local update_sync_status = function()
+    local ok, err = kong.db.clustering_data_planes:upsert({ id = dp_id, }, {
+      last_seen = last_seen,
+      config_hash = config_hash ~= "" and config_hash or nil,
+      hostname = dp_hostname,
+      ip = dp_ip,
+      version = dp_version,
+      sync_status = sync_status, -- TODO: import may have been failed though
+    }, { ttl = purge_delay })
+    if not ok then
+      ngx_log(ngx_ERR, _log_prefix, "unable to update clustering data plane status: ", err, log_suffix)
+    end
+  end
+
+  _, err, sync_status = self:check_version_compatibility(dp_version, dp_plugins_map, log_suffix)
+  if err then
+    ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
+    wb:send_close()
+    update_sync_status()
+    return ngx_exit(ngx_CLOSE)
+  end
 
   ngx_log(ngx_DEBUG, _log_prefix, "data plane connected", log_suffix)
 
