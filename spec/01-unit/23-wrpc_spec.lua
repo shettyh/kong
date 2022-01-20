@@ -82,26 +82,26 @@ describe("wRPC tools", function()
 
     assert.same({type = ".kong.services.config.v1.SyncConfigRequest", data = req_data}, mock_buff_pop("encode"))
     assert.same({type = "wrpc.WebsocketPayload", data = {
-      version = 1,
+      version = "PAYLOAD_VERSION_V1",
       payload = {
         svc_id = 1,
         rpc_id = 2,
         seq = 1,
-        mtype = 2,
+        mtype = "MESSAGE_TYPE_RPC",
         deadline = ngx.now() + 10,
-        payload_encoding = 1,
+        payload_encoding = "ENCODING_PROTO3",
         payloads = { req_data },
       },
     }}, mock_buff_pop("encode"))
     assert.same({
-      version = 1,
+      version = "PAYLOAD_VERSION_V1",
       payload = {
         svc_id = 1,
         rpc_id = 2,
         seq = 1,
-        mtype = 2,
+        mtype = "MESSAGE_TYPE_RPC",
         deadline = ngx.now() + 10,
-        payload_encoding = 1,
+        payload_encoding = "ENCODING_PROTO3",
         payloads = { req_data },
       },
     }, mock_buff_pop("send"))
@@ -112,22 +112,22 @@ describe("wRPC tools", function()
     assert.equal("no response", err)
 
     mock_buffer_add("receive", {
-      version = 1,
+      version = "PAYLOAD_VERSION_V1",
       payload = {
-        mtype = 2,  -- MESSAGE_TYPE_RPC
+        mtype = "MESSAGE_TYPE_RPC",
         svc_id = 1, -- ConfigService
         rpc_id = 2, -- SyncConfig
         seq = 67,
         ack = call_id,
         deadline = math.huge,
-        payload_encoding = 1, -- ENCODING_PROTO3
-        payloads = { accepted = true }
+        payload_encoding = "ENCODING_PROTO3",
+        payloads = { { accepted = true } }
       }
     })
     peer:step()
     response, err = peer:get_response(call_id)
     assert.is_nil(err)
-    assert.same({ accepted = true }, response)
+    assert.same({ { accepted = true } }, response)
 
   end)
 end)
