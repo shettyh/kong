@@ -160,7 +160,10 @@ function wrpc_peer:close()
   --if self._receiving_thread then
   --  ngx.thread.wait(self._receiving_thread)
   --end
-  self.conn:close()
+  self.conn:send_close()
+  if self.conn.close then
+    self.conn:close()
+  end
 end
 
 
@@ -195,6 +198,15 @@ end
 --- RPC call.
 --- returns the call sequence number, doesn't wait for response.
 function wrpc_peer:call(name, ...)
+  local rpc, payloads = assert(self:encode_args(name, ...))
+  return self:send_encoded_call(rpc, payloads)
+end
+
+--- Part of wrpc_peer:call()
+--- If calling the same method with the same args several times,
+--- (to the same or different peers), this method returns the
+--- invariant part, so it can be cached to reduce encoding overhead
+function wrpc_peer:encode_args(name, ...)
   local rpc = self.service:get_method(name)
   if not rpc then
     return nil, string.format("no method %q", name)
@@ -203,9 +215,18 @@ function wrpc_peer:call(name, ...)
   local num_args = select('#', ...)
   local payloads = table.new(num_args, 0)
   for i = 1, num_args do
-    payloads[i] = self.encode(rpc.input_type, select(i, ...))
+    payloads[i] = assert(self.encode(rpc.input_type, select(i, ...)))
   end
 
+  return rpc, payloads
+end
+
+--- Part of wrpc_peer:call()
+--- This performs the per-call parts.  The arguments
+--- are the return values from wrpc_peer:encode_args(),
+--- either directly or cached (to repeat the same call
+--- several times).
+function wrpc_peer:send_encoded_call(rpc, payloads)
   self:send_payload({
     mtype = "MESSAGE_TYPE_RPC",
     svc_id = rpc.service_id,
