@@ -157,9 +157,9 @@ end
 
 function wrpc_peer:close()
   self.closing = true
-  if self._receiving_thread then
-    ngx.thread.wait(self._receiving_thread)
-  end
+  --if self._receiving_thread then
+  --  ngx.thread.wait(self._receiving_thread)
+  --end
   self.conn:close()
 end
 
@@ -207,7 +207,7 @@ function wrpc_peer:call(name, ...)
   end
 
   self:send_payload({
-    mtype = 2, -- MESSAGE_TYPE_RPC,
+    mtype = "MESSAGE_TYPE_RPC",
     svc_id = rpc.service_id,
     rpc_id = rpc.rpc_id,
     payload_encoding = "ENCODING_PROTO3",
@@ -267,15 +267,15 @@ function wrpc_peer:handle(payload)
   if ack > 0 then
     -- response to a previous call
     self.response_queue[ack] = decodearray(self.decode, rpc.output_type, payload.payloads)
-    pp("response:", ack, self.response_queue[ack])
+    --pp("response:", ack, self.response_queue[ack])
 
   else
     -- incoming method call
     if rpc.handler then
       local input_data = decodearray(self.decode, rpc.input_type, payload.payloads)
-      local ok, output_data = ok_wrapper(pcall(rpc.handler, table_unpack(input_data, 1, input_data.n)))
+      local ok, output_data = ok_wrapper(pcall(rpc.handler, self, table_unpack(input_data, 1, input_data.n)))
       if not ok then
-        return nil, output_data   -- TODO: send error to peer
+        return nil, output_data   -- TODO: send error to logs and peer
       end
       self:send_payload({
         mtype = "MESSAGE_TYPE_RPC", -- MESSAGE_TYPE_RPC,
@@ -315,7 +315,7 @@ function wrpc_peer:receive_thread()
   self._receiving_thread = assert(ngx.thread.spawn(function()
     while not exiting() and not self.closing do
       self:step()
-      ngx.sleep(1)
+      ngx.sleep(0)
     end
   end))
 end

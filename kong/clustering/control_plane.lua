@@ -61,6 +61,7 @@ local MAJOR_MINOR_PATTERN = "^(%d+)%.(%d+)%.%d+"
 local REMOVED_FIELDS = require("kong.clustering.compat.removed_fields")
 local _log_prefix = "[clustering] "
 
+local clients = {}
 
 local function extract_major_minor(version)
   if type(version) ~= "string" then
@@ -568,13 +569,30 @@ function _M:handle_cp_websocket()
   if not wrpc_config_service then
     wrpc_config_service = wrpc.new_service()
     wrpc_config_service:add("kong.services.config.v1.config")
-    wrpc_config_service:set_handler("ConfigService.ReportBasicInfo", function(data)
+    wrpc_config_service:set_handler("ConfigService.PingCP", function(peer)
+      --ngx_log(ngx_DEBUG, string.format("handling PingCP.  peer: %q, peer.conn: %q", peer, peer.conn))
+      local client = clients[peer.conn]
+      if client then
+        client.last_seen = ngx_time()
+        ngx_log(ngx_DEBUG, _log_prefix, "received ping frame from data plane", log_suffix)
+
+        --config_hash = data
+        --last_seen = ngx_time()
+        --update_sync_status()
+      end
+    end)
+    wrpc_config_service:set_handler("ConfigService.ReportBasicInfo", function(peer, data)
       ngx_log(ngx_DEBUG, _log_prefix, "received basic_info", log_suffix)
       basic_info = data
       basic_info_semaphore:post()
     end)
   end
   local w_peer = wrpc.new_peer(wb, wrpc_config_service)
+  --ngx_log(ngx_DEBUG, string.format("wb: %q, w_peer: %q, w_peer.conn: %q", wb, w_peer, w_peer.conn))
+  clients[w_peer.conn] = {
+    last_seen = ngx_time(),
+    peer = w_peer,
+  }
   w_peer:receive_thread()
   --ngx.thread.wait(w_peer._receiving_thread)
   --do return ngx_exit(ngx_CLOSE) end
@@ -653,6 +671,8 @@ function _M:handle_cp_websocket()
   end
 
   ngx_log(ngx_DEBUG, _log_prefix, "data plane connected", log_suffix)
+  ngx.thread.wait(w_peer._receiving_thread)
+  do return ngx_exit(ngx_CLOSE) end
 
   local queue
   do

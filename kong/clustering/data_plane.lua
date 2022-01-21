@@ -314,7 +314,8 @@ function _M:communicate(premature)
 
   local write_thread = ngx.thread.spawn(function()
     while not exiting() do
-      send_ping(peer, log_suffix)
+      assert(peer:call("ConfigService.PingCP", {}))
+      ngx_log(ngx_DEBUG, _log_prefix, "sent ping", log_suffix)
 
       for _ = 1, PING_INTERVAL do
         ngx_sleep(1)
