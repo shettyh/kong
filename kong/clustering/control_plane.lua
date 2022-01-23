@@ -102,9 +102,9 @@ local function plugins_list_to_map(plugins_list)
 end
 
 
-local function is_timeout(err)
-  return err and string.sub(err, -7) == "timeout"
-end
+--local function is_timeout(err)
+--  return err and string.sub(err, -7) == "timeout"
+--end
 
 
 function _M.new(parent)
@@ -198,7 +198,7 @@ end
 _M._get_removed_fields = get_removed_fields
 
 -- returns has_update, modified_deflated_payload, err
-local function update_compatible_payload(payload, dp_version, log_suffix)
+local function update_compatible_payload(payload, dp_version)
   local fields = get_removed_fields(dp_version_num(dp_version))
 
   if fields then
@@ -342,7 +342,8 @@ function _M:validate_shared_cert()
     return nil, "unable to load data plane client certificate during handshake: " .. err
   end
 
-  local digest, err = cert:digest("sha256")
+  local digest
+  digest, err = cert:digest("sha256")
   if not digest then
     return nil, "unable to retrieve data plane client certificate digest during handshake: " .. err
   end
@@ -562,32 +563,34 @@ function _M:handle_cp_websocket()
     log_suffix = ""
   end
 
-  local _, err
+  do
+    local _, err
 
-  -- use mutual TLS authentication
-  if self.conf.cluster_mtls == "shared" then
-    _, err = self:validate_shared_cert()
+    -- use mutual TLS authentication
+    if self.conf.cluster_mtls == "shared" then
+      _, err = self:validate_shared_cert()
 
-  elseif self.conf.cluster_ocsp ~= "off" then
-    local ok
-    ok, err = check_for_revocation_status()
-    if ok == false then
-      err = "data plane client certificate was revoked: " ..  err
+    elseif self.conf.cluster_ocsp ~= "off" then
+      local ok
+      ok, err = check_for_revocation_status()
+      if ok == false then
+        err = "data plane client certificate was revoked: " ..  err
 
-    elseif not ok then
-      if self.conf.cluster_ocsp == "on" then
-        err = "data plane client certificate revocation check failed: " .. err
+      elseif not ok then
+        if self.conf.cluster_ocsp == "on" then
+          err = "data plane client certificate revocation check failed: " .. err
 
-      else
-        ngx_log(ngx_WARN, _log_prefix, "data plane client certificate revocation check failed: ", err, log_suffix)
-        err = nil
+        else
+          ngx_log(ngx_WARN, _log_prefix, "data plane client certificate revocation check failed: ", err, log_suffix)
+          err = nil
+        end
       end
     end
-  end
 
-  if err then
-    ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
-    return ngx_exit(ngx_CLOSE)
+    if err then
+      ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
+      return ngx_exit(ngx_CLOSE)
+    end
   end
 
   if not dp_id then
@@ -600,7 +603,8 @@ function _M:handle_cp_websocket()
     ngx_exit(400)
   end
 
-  local wb, err = ws_server:new(WS_OPTS)
+  local wb
+  wb, err = ws_server:new(WS_OPTS)
   if not wb then
     ngx_log(ngx_ERR, _log_prefix, "failed to perform server side websocket handshake: ", err, log_suffix)
     return ngx_exit(ngx_CLOSE)
@@ -625,7 +629,7 @@ function _M:handle_cp_websocket()
         --update_sync_status()
       end
     end)
-    wrpc_config_service:set_handler("ConfigService.ReportBasicInfo", function(peer, data)
+    wrpc_config_service:set_handler("ConfigService.ReportBasicInfo", function(_, data)
       ngx_log(ngx_DEBUG, _log_prefix, "received basic_info", log_suffix)
       basic_info = data
       basic_info_semaphore:post()
@@ -677,18 +681,20 @@ function _M:handle_cp_websocket()
   --  end
   --end
 
-  local ok, err = basic_info_semaphore:wait(5)
-  if not ok then
-    err = "waiting for basic info call: " .. (err or "--")
-  end
-  if not basic_info then
-    err = "invalid basic_info data"
-  end
+  do
+    local ok, err = basic_info_semaphore:wait(5)
+    if not ok then
+      err = "waiting for basic info call: " .. (err or "--")
+    end
+    if not basic_info then
+      err = "invalid basic_info data"
+    end
 
-  if err then
-    ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
-    wb:send_close()
-    return ngx_exit(ngx_CLOSE)
+    if err then
+      ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
+      wb:send_close()
+      return ngx_exit(ngx_CLOSE)
+    end
   end
 
   client.dp_plugins_map = plugins_list_to_map(basic_info.plugins)
@@ -720,188 +726,190 @@ function _M:handle_cp_websocket()
 
   ngx_log(ngx_DEBUG, _log_prefix, "data plane connected", log_suffix)
   ngx.thread.wait(w_peer._receiving_thread)
+  w_peer:close()
+  clients[wb] = nil
   do return ngx_exit(ngx_CLOSE) end
 
-  --local queue
-  --do
-  --  local queue_semaphore = semaphore.new()
-  --  queue = {
-  --    wait = function(...)
-  --      return queue_semaphore:wait(...)
-  --    end,
-  --    post = function(...)
-  --      return queue_semaphore:post(...)
-  --    end
-  --  }
+  ----local queue
+  ----do
+  ----  local queue_semaphore = semaphore.new()
+  ----  queue = {
+  ----    wait = function(...)
+  ----      return queue_semaphore:wait(...)
+  ----    end,
+  ----    post = function(...)
+  ----      return queue_semaphore:post(...)
+  ----    end
+  ----  }
+  ----end
+  ----
+  ----self.clients[wb] = queue
+  --
+  --if not self.deflated_reconfigure_payload then
+  --  _, err = self:export_deflated_reconfigure_payload()
   --end
   --
-  --self.clients[wb] = queue
-
-  if not self.deflated_reconfigure_payload then
-    _, err = self:export_deflated_reconfigure_payload()
-  end
-
-  if self.deflated_reconfigure_payload then
-    -- initial configuration compatibility for sync status variable
-    _, _, client.sync_status = self:check_configuration_compatibility(client.dp_plugins_map)
-
-    table_insert(queue, self.deflated_reconfigure_payload)
-    queue.post()
-
-  else
-    ngx_log(ngx_ERR, _log_prefix, "unable to send initial configuration to data plane: ", err, log_suffix)
-  end
-
-  -- how control plane connection management works:
-  -- two threads are spawned, when any of these threads exits,
-  -- it means a fatal error has occurred on the connection,
-  -- and the other thread is also killed
+  --if self.deflated_reconfigure_payload then
+  --  -- initial configuration compatibility for sync status variable
+  --  _, _, client.sync_status = self:check_configuration_compatibility(client.dp_plugins_map)
   --
-  -- * read_thread: it is the only thread that receives websocket frames from the
-  --                data plane and records the current data plane status in the
-  --                database, and is also responsible for handling timeout detection
-  -- * write_thread: it is the only thread that sends websocket frames to the data plane
-  --                 by grabbing any messages currently in the send queue and
-  --                 send them to the data plane in a FIFO order. Notice that the
-  --                 PONG frames are also sent by this thread after they are
-  --                 queued by the read_thread
-
-  --local read_thread = ngx.thread.spawn(function()
+  --  table_insert(queue, self.deflated_reconfigure_payload)
+  --  queue.post()
+  --
+  --else
+  --  ngx_log(ngx_ERR, _log_prefix, "unable to send initial configuration to data plane: ", err, log_suffix)
+  --end
+  --
+  ---- how control plane connection management works:
+  ---- two threads are spawned, when any of these threads exits,
+  ---- it means a fatal error has occurred on the connection,
+  ---- and the other thread is also killed
+  ----
+  ---- * read_thread: it is the only thread that receives websocket frames from the
+  ----                data plane and records the current data plane status in the
+  ----                database, and is also responsible for handling timeout detection
+  ---- * write_thread: it is the only thread that sends websocket frames to the data plane
+  ----                 by grabbing any messages currently in the send queue and
+  ----                 send them to the data plane in a FIFO order. Notice that the
+  ----                 PONG frames are also sent by this thread after they are
+  ----                 queued by the read_thread
+  --
+  ----local read_thread = ngx.thread.spawn(function()
+  ----  while not exiting() do
+  ----    local data, typ, err = wb:recv_frame()
+  ----
+  ----    if exiting() then
+  ----      return
+  ----    end
+  ----
+  ----    if err then
+  ----      if not is_timeout(err) then
+  ----        return nil, err
+  ----      end
+  ----
+  ----      local waited = ngx_time() - last_seen
+  ----      if waited > PING_WAIT then
+  ----        return nil, "did not receive ping frame from data plane within " ..
+  ----                    PING_WAIT .. " seconds"
+  ----      end
+  ----
+  ----    else
+  ----      if typ == "close" then
+  ----        ngx_log(ngx_DEBUG, _log_prefix, "received close frame from data plane", log_suffix)
+  ----        return
+  ----      end
+  ----
+  ----      if not data then
+  ----        return nil, "did not receive ping frame from data plane"
+  ----      end
+  ----
+  ----      -- dps only send pings
+  ----      if typ ~= "ping" then
+  ----        return nil, "invalid websocket frame received from data plane: " .. typ
+  ----      end
+  ----
+  ----      ngx_log(ngx_DEBUG, _log_prefix, "received ping frame from data plane", log_suffix)
+  ----
+  ----      config_hash = data
+  ----      last_seen = ngx_time()
+  ----      update_sync_status()
+  ----
+  ----      -- queue PONG to avoid races
+  ----      table_insert(queue, PONG_TYPE)
+  ----      queue.post()
+  ----    end
+  ----  end
+  ----end)
+  --
+  --local write_thread = ngx.thread.spawn(function()
   --  while not exiting() do
-  --    local data, typ, err = wb:recv_frame()
-  --
+  --    local ok, err = queue.wait(5)
   --    if exiting() then
   --      return
   --    end
-  --
-  --    if err then
-  --      if not is_timeout(err) then
-  --        return nil, err
+  --    if ok then
+  --      local payload = table_remove(queue, 1)
+  --      if not payload then
+  --        return nil, "config queue can not be empty after semaphore returns"
   --      end
   --
-  --      local waited = ngx_time() - last_seen
-  --      if waited > PING_WAIT then
-  --        return nil, "did not receive ping frame from data plane within " ..
-  --                    PING_WAIT .. " seconds"
+  --      if payload == PONG_TYPE then
+  --        local _, err = wb:send_pong()
+  --        if err then
+  --          if not is_timeout(err) then
+  --            return nil, "failed to send pong frame to data plane: " .. err
+  --          end
+  --
+  --          ngx_log(ngx_NOTICE, _log_prefix, "failed to send pong frame to data plane: ", err, log_suffix)
+  --
+  --        else
+  --          ngx_log(ngx_DEBUG, _log_prefix, "sent pong frame to data plane", log_suffix)
+  --        end
+  --
+  --      else -- is reconfigure
+  --        local previous_sync_status = sync_status
+  --        ok, err, sync_status = self:check_configuration_compatibility(dp_plugins_map)
+  --        if ok then
+  --          local has_update, deflated_payload, err = update_compatible_payload(self.reconfigure_payload, dp_version)
+  --          if not has_update then -- no modification, use the cached payload
+  --            deflated_payload = self.deflated_reconfigure_payload
+  --          elseif err then
+  --            ngx_log(ngx_WARN, "unable to update compatible payload: ", err, ", the unmodified config ",
+  --                    "is returned", log_suffix)
+  --            deflated_payload = self.deflated_reconfigure_payload
+  --          end
+  --
+  --          -- config update
+  --          local _, err = wb:send_binary(deflated_payload)
+  --          if err then
+  --            if not is_timeout(err) then
+  --              return nil, "unable to send updated configuration to data plane: " .. err
+  --            end
+  --
+  --            ngx_log(ngx_NOTICE, _log_prefix, "unable to send updated configuration to data plane: ", err, log_suffix)
+  --
+  --          else
+  --            ngx_log(ngx_DEBUG, _log_prefix, "sent config update to data plane", log_suffix)
+  --          end
+  --
+  --        else
+  --          ngx_log(ngx_WARN, _log_prefix, "unable to send updated configuration to data plane: ", err, log_suffix)
+  --          if sync_status ~= previous_sync_status then
+  --            update_sync_status()
+  --          end
+  --        end
   --      end
   --
-  --    else
-  --      if typ == "close" then
-  --        ngx_log(ngx_DEBUG, _log_prefix, "received close frame from data plane", log_suffix)
-  --        return
-  --      end
-  --
-  --      if not data then
-  --        return nil, "did not receive ping frame from data plane"
-  --      end
-  --
-  --      -- dps only send pings
-  --      if typ ~= "ping" then
-  --        return nil, "invalid websocket frame received from data plane: " .. typ
-  --      end
-  --
-  --      ngx_log(ngx_DEBUG, _log_prefix, "received ping frame from data plane", log_suffix)
-  --
-  --      config_hash = data
-  --      last_seen = ngx_time()
-  --      update_sync_status()
-  --
-  --      -- queue PONG to avoid races
-  --      table_insert(queue, PONG_TYPE)
-  --      queue.post()
+  --    elseif err ~= "timeout" then
+  --      return nil, "semaphore wait error: " .. err
   --    end
   --  end
   --end)
-
-  local write_thread = ngx.thread.spawn(function()
-    while not exiting() do
-      local ok, err = queue.wait(5)
-      if exiting() then
-        return
-      end
-      if ok then
-        local payload = table_remove(queue, 1)
-        if not payload then
-          return nil, "config queue can not be empty after semaphore returns"
-        end
-
-        if payload == PONG_TYPE then
-          local _, err = wb:send_pong()
-          if err then
-            if not is_timeout(err) then
-              return nil, "failed to send pong frame to data plane: " .. err
-            end
-
-            ngx_log(ngx_NOTICE, _log_prefix, "failed to send pong frame to data plane: ", err, log_suffix)
-
-          else
-            ngx_log(ngx_DEBUG, _log_prefix, "sent pong frame to data plane", log_suffix)
-          end
-
-        else -- is reconfigure
-          local previous_sync_status = sync_status
-          ok, err, sync_status = self:check_configuration_compatibility(dp_plugins_map)
-          if ok then
-            local has_update, deflated_payload, err = update_compatible_payload(self.reconfigure_payload, dp_version)
-            if not has_update then -- no modification, use the cached payload
-              deflated_payload = self.deflated_reconfigure_payload
-            elseif err then
-              ngx_log(ngx_WARN, "unable to update compatible payload: ", err, ", the unmodified config ",
-                      "is returned", log_suffix)
-              deflated_payload = self.deflated_reconfigure_payload
-            end
-
-            -- config update
-            local _, err = wb:send_binary(deflated_payload)
-            if err then
-              if not is_timeout(err) then
-                return nil, "unable to send updated configuration to data plane: " .. err
-              end
-
-              ngx_log(ngx_NOTICE, _log_prefix, "unable to send updated configuration to data plane: ", err, log_suffix)
-
-            else
-              ngx_log(ngx_DEBUG, _log_prefix, "sent config update to data plane", log_suffix)
-            end
-
-          else
-            ngx_log(ngx_WARN, _log_prefix, "unable to send updated configuration to data plane: ", err, log_suffix)
-            if sync_status ~= previous_sync_status then
-              update_sync_status()
-            end
-          end
-        end
-
-      elseif err ~= "timeout" then
-        return nil, "semaphore wait error: " .. err
-      end
-    end
-  end)
-
-  local ok, err, perr = ngx.thread.wait(write_thread, read_thread)
-
-  self.clients[wb] = nil
-
-  ngx.thread.kill(write_thread)
-  ngx.thread.kill(read_thread)
-
-  wb:send_close()
-
-  --TODO: should we update disconnect data plane status?
-  --sync_status = CLUSTERING_SYNC_STATUS.UNKNOWN
-  --update_sync_status()
-
-  if not ok then
-    ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
-    return ngx_exit(ngx_ERR)
-  end
-
-  if perr then
-    ngx_log(ngx_ERR, _log_prefix, perr, log_suffix)
-    return ngx_exit(ngx_ERR)
-  end
-
-  return ngx_exit(ngx_OK)
+  --
+  --local ok, err, perr = ngx.thread.wait(write_thread, read_thread)
+  --
+  --self.clients[wb] = nil
+  --
+  --ngx.thread.kill(write_thread)
+  --ngx.thread.kill(read_thread)
+  --
+  --wb:send_close()
+  --
+  ----TODO: should we update disconnect data plane status?
+  ----sync_status = CLUSTERING_SYNC_STATUS.UNKNOWN
+  ----update_sync_status()
+  --
+  --if not ok then
+  --  ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
+  --  return ngx_exit(ngx_ERR)
+  --end
+  --
+  --if perr then
+  --  ngx_log(ngx_ERR, _log_prefix, perr, log_suffix)
+  --  return ngx_exit(ngx_ERR)
+  --end
+  --
+  --return ngx_exit(ngx_OK)
 end
 
 
@@ -911,9 +919,11 @@ local function push_config_loop(premature, self, push_config_semaphore, delay)
     return
   end
 
-  local _, err = self:export_deflated_reconfigure_payload()
-  if err then
-    ngx_log(ngx_ERR, _log_prefix, "unable to export initial config from database: ", err)
+  do
+    local _, err = self:export_deflated_reconfigure_payload()
+    if err then
+      ngx_log(ngx_ERR, _log_prefix, "unable to export initial config from database: ", err)
+    end
   end
 
   while not exiting() do
