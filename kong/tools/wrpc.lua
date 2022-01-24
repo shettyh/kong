@@ -136,6 +136,26 @@ function wrpc_service:set_handler(rpc_name, handler)
 end
 
 
+--- Part of wrpc_peer:call()
+--- If calling the same method with the same args several times,
+--- (to the same or different peers), this method returns the
+--- invariant part, so it can be cached to reduce encoding overhead
+function wrpc_service:encode_args(name, ...)
+  local rpc = self:get_method(name)
+  if not rpc then
+    return nil, string.format("no method %q", name)
+  end
+
+  local num_args = select('#', ...)
+  local payloads = table.new(num_args, 0)
+  for i = 1, num_args do
+    payloads[i] = assert(pb.encode(rpc.input_type, select(i, ...)))
+  end
+
+  return rpc, payloads
+end
+
+
 local wrpc_peer = {
   encode = pb.encode,
   decode = pb.decode,
@@ -198,28 +218,10 @@ end
 --- RPC call.
 --- returns the call sequence number, doesn't wait for response.
 function wrpc_peer:call(name, ...)
-  local rpc, payloads = assert(self:encode_args(name, ...))
+  local rpc, payloads = assert(self.service:encode_args(name, ...))
   return self:send_encoded_call(rpc, payloads)
 end
 
---- Part of wrpc_peer:call()
---- If calling the same method with the same args several times,
---- (to the same or different peers), this method returns the
---- invariant part, so it can be cached to reduce encoding overhead
-function wrpc_peer:encode_args(name, ...)
-  local rpc = self.service:get_method(name)
-  if not rpc then
-    return nil, string.format("no method %q", name)
-  end
-
-  local num_args = select('#', ...)
-  local payloads = table.new(num_args, 0)
-  for i = 1, num_args do
-    payloads[i] = assert(self.encode(rpc.input_type, select(i, ...)))
-  end
-
-  return rpc, payloads
-end
 
 --- Part of wrpc_peer:call()
 --- This performs the per-call parts.  The arguments
