@@ -61,7 +61,41 @@ local MAJOR_MINOR_PATTERN = "^(%d+)%.(%d+)%.%d+"
 local REMOVED_FIELDS = require("kong.clustering.compat.removed_fields")
 local _log_prefix = "[clustering] "
 
-local clients = {}
+local wrpc_config_service
+--local clients = {}
+
+local function get_config_service(self)
+  if not wrpc_config_service then
+    print("loading service!!")
+    wrpc_config_service = wrpc.new_service()
+    wrpc_config_service:add("kong.services.config.v1.config")
+    wrpc_config_service:set_handler("ConfigService.PingCP", function(peer)
+      --ngx_log(ngx_DEBUG, string.format("handling PingCP.  peer: %q, peer.conn: %q", peer, peer.conn))
+      local client = self.clients[peer.conn]
+      if client then
+        ngx_log(ngx_DEBUG, _log_prefix, "found client: ", client.dp_id)
+        client.last_seen = ngx_time()
+        ngx_log(ngx_DEBUG, _log_prefix, "received ping frame from data plane")
+
+        --config_hash = data
+        --last_seen = ngx_time()
+        --update_sync_status()
+      end
+    end)
+    wrpc_config_service:set_handler("ConfigService.ReportBasicInfo", function(peer, data)
+      ngx_log(ngx_DEBUG, _log_prefix, "received basic_info")
+      local client = self.clients[peer.conn]
+      if client then
+        ngx_log(ngx_DEBUG, _log_prefix, "found client: ", client.dp_id)
+        client.basic_info = data
+        client.basic_info_semaphore:post()
+      end
+    end)
+  end
+
+  return wrpc_config_service
+end
+
 
 local function extract_major_minor(version)
   if type(version) ~= "string" then
@@ -197,6 +231,23 @@ end
 -- for test
 _M._get_removed_fields = get_removed_fields
 
+local function simplify_things(val)
+  local typ = type(val)
+  if typ == "table" then
+    local out = {}
+    for k, v in pairs(val) do
+      if type(k) == "string" or type(k) == "number" then
+        out[k] = simplify_things(v)
+      end
+    end
+    return out
+  end
+
+  if typ == "string" or typ == "number" or typ == "boolean" then
+    return val
+  end
+end
+
 -- returns has_update, modified_deflated_payload, err
 local function update_compatible_payload(payload, dp_version)
   local fields = get_removed_fields(dp_version_num(dp_version))
@@ -243,25 +294,49 @@ function _M:export_deflated_reconfigure_payload()
 
   local config_hash = self:calculate_config_hash(config_table)
 
-  local payload = {
-    type = "reconfigure",
-    timestamp = ngx_now(),
-    config_table = config_table,
-    config_hash = config_hash,
-  }
+  --local payload = {
+  --  type = "reconfigure",
+  --  timestamp = ngx_now(),
+  --  config_table = config_table,
+  --  config_hash = config_hash,
+  --}
 
-  if not payload then
-    return nil, err
-  end
-  self.reconfigure_payload = payload
+  local payload = simplify_things({
+    format_version = config_table._format_version,
+    services = config_table.services,
+    routes = config_table.routes,
+    consumers = config_table.consumers,
+    plugins = config_table.plugins,
+    upstreams = config_table.upstreams,
+    targets = config_table.targets,
+    certificates = config_table.certificates,
+    snis = config_table.snis,
+    ca_certificates = config_table.ca_certificates,
+    plugin_data = config_table.plugin_data,
+    workspaces = config_table.workspaces,
+  })
+  --do
+  --  local comment = payload.workspaces[1].comment
+  --  require "pl.pretty".debug("comment", comment, type(comment), getmetatable(comment), debug.getmetatable(comment))
+  --end
+  local service = get_config_service(self)
+  self.config_call_rpc, self.config_call_args = assert(service:encode_args("ConfigService.SyncConfig", {
+    config = payload,
+    version = 192, -- TODO: version?
+  }))
 
-  payload, err = deflate_gzip(cjson_encode(payload))
-  if not payload then
-    return nil, err
-  end
+  --if not payload then
+  --  return nil, err
+  --end
+  --self.reconfigure_payload = payload
+  --
+  --payload, err = deflate_gzip(cjson_encode(payload))
+  --if not payload then
+  --  return nil, err
+  --end
 
   self.current_config_hash = config_hash
-  self.deflated_reconfigure_payload = payload
+  --self.deflated_reconfigure_payload = payload
 
   return payload, nil, config_hash
 end
@@ -269,11 +344,7 @@ end
 
 local function push_config_one_client(self, client)
 
-  local config_version = 3 -- TODO: get something here: version, hash, whatever.
-  client.peer:call("ConfigService.SyncConfig", {
-    config = {},    -- TODO: put config data here.
-    version = config_version,
-  })
+  client.peer:send_encoded_call(self.config_call_rpc, self.config_call_args)
   --
   --
   --local previous_sync_status = client.sync_status
@@ -320,12 +391,16 @@ function _M:push_config()
   end
 
   local n = 0
-  for _, client in pairs(clients) do
-    push_config_one_client(_M, client)
+  for _, client in pairs(self.clients) do
+    --push_config_one_client(_M, client)
+    require "pl.pretty".debug("encoded call:", self.config_call_rpc, self.config_call_args)
+    client.peer:send_encoded_call(self.config_call_rpc, self.config_call_args)
+
     n = n + 1
   end
 
   ngx_log(ngx_DEBUG, _log_prefix, "config pushed to ", n, " clients")
+  return n
 end
 
 
@@ -532,8 +607,6 @@ function _M:check_configuration_compatibility(dp_plugin_map)
   return true, nil, CLUSTERING_SYNC_STATUS.NORMAL
 end
 
-local wrpc_config_service
-
 function _M:handle_cp_websocket()
   local dp_id = ngx_var.arg_node_id
   local dp_hostname = ngx_var.arg_node_hostname
@@ -604,38 +677,17 @@ function _M:handle_cp_websocket()
   end
 
   local wb
-  wb, err = ws_server:new(WS_OPTS)
-  if not wb then
-    ngx_log(ngx_ERR, _log_prefix, "failed to perform server side websocket handshake: ", err, log_suffix)
-    return ngx_exit(ngx_CLOSE)
+  do
+    local err
+    wb, err = ws_server:new(WS_OPTS)
+    if not wb then
+      ngx_log(ngx_ERR, _log_prefix, "failed to perform server side websocket handshake: ", err, log_suffix)
+      return ngx_exit(ngx_CLOSE)
+    end
   end
 
   -- connection established
-  local basic_info
-  local basic_info_semaphore = semaphore.new()
-
-  if not wrpc_config_service then
-    wrpc_config_service = wrpc.new_service()
-    wrpc_config_service:add("kong.services.config.v1.config")
-    wrpc_config_service:set_handler("ConfigService.PingCP", function(peer)
-      --ngx_log(ngx_DEBUG, string.format("handling PingCP.  peer: %q, peer.conn: %q", peer, peer.conn))
-      local client = clients[peer.conn]
-      if client then
-        client.last_seen = ngx_time()
-        ngx_log(ngx_DEBUG, _log_prefix, "received ping frame from data plane", log_suffix)
-
-        --config_hash = data
-        --last_seen = ngx_time()
-        --update_sync_status()
-      end
-    end)
-    wrpc_config_service:set_handler("ConfigService.ReportBasicInfo", function(_, data)
-      ngx_log(ngx_DEBUG, _log_prefix, "received basic_info", log_suffix)
-      basic_info = data
-      basic_info_semaphore:post()
-    end)
-  end
-  local w_peer = wrpc.new_peer(wb, wrpc_config_service)
+  local w_peer = wrpc.new_peer(wb, get_config_service(self))
   --ngx_log(ngx_DEBUG, string.format("wb: %q, w_peer: %q, w_peer.conn: %q", wb, w_peer, w_peer.conn))
   local client = {
     last_seen = ngx_time(),
@@ -643,8 +695,10 @@ function _M:handle_cp_websocket()
     dp_id = dp_id,
     dp_version = dp_version,
     log_suffix = log_suffix,
+    basic_info = nil,
+    basic_info_semaphore = semaphore.new()
   }
-  clients[w_peer.conn] = client
+  self.clients[w_peer.conn] = client
   w_peer:receive_thread()
   --ngx.thread.wait(w_peer._receiving_thread)
   --do return ngx_exit(ngx_CLOSE) end
@@ -682,11 +736,11 @@ function _M:handle_cp_websocket()
   --end
 
   do
-    local ok, err = basic_info_semaphore:wait(5)
+    local ok, err = client.basic_info_semaphore:wait(5)
     if not ok then
       err = "waiting for basic info call: " .. (err or "--")
     end
-    if not basic_info then
+    if not client.basic_info then
       err = "invalid basic_info data"
     end
 
@@ -697,7 +751,9 @@ function _M:handle_cp_websocket()
     end
   end
 
-  client.dp_plugins_map = plugins_list_to_map(basic_info.plugins)
+  require "pl.pretty".debug("basic_info", client.basic_info)
+
+  client.dp_plugins_map = plugins_list_to_map(client.basic_info.plugins)
   client.config_hash = string.rep("0", 32) -- initial hash
   --local last_seen = ngx_time()
   client.sync_status = CLUSTERING_SYNC_STATUS.UNKNOWN
@@ -716,18 +772,21 @@ function _M:handle_cp_websocket()
     end
   end
 
-  _, err, client.sync_status = self:check_version_compatibility(dp_version, client.dp_plugins_map, log_suffix)
-  if err then
-    ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
-    wb:send_close()
-    client.update_sync_status()
-    return ngx_exit(ngx_CLOSE)
+  do
+    local _, err
+    _, err, client.sync_status = self:check_version_compatibility(dp_version, client.dp_plugins_map, log_suffix)
+    if err then
+      ngx_log(ngx_ERR, _log_prefix, err, log_suffix)
+      wb:send_close()
+      client.update_sync_status()
+      return ngx_exit(ngx_CLOSE)
+    end
   end
 
   ngx_log(ngx_DEBUG, _log_prefix, "data plane connected", log_suffix)
   ngx.thread.wait(w_peer._receiving_thread)
   w_peer:close()
-  clients[wb] = nil
+  self.clients[wb] = nil
   do return ngx_exit(ngx_CLOSE) end
 
   ----local queue
