@@ -2141,6 +2141,39 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
             end)
           end
         end)
+
+        describe("check regex with '\\'", function()
+          local use_case
+          local _get_expression = atc_compat._get_expression
+
+          before_each(function()
+            use_case = {
+              {
+                service = service,
+                route = {
+                  id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+                  methods = { "GET" },
+                },
+              },
+            }
+          end)
+
+          it("regex path has double '\\'", function()
+            use_case[1].route.paths = { [[~/\\/*$]], }
+
+            assert.equal([[(http.method == "GET") && (http.path ~ "^/\\\\/*$")]],
+                         _get_expression(use_case[1].route))
+            assert(new_router(use_case))
+          end)
+
+          it("regex path has '\\d'", function()
+            use_case[1].route.paths = { [[~/\d+]], }
+
+            assert.equal([[(http.method == "GET") && (http.path ~ "^/\\d+")]],
+                         _get_expression(use_case[1].route))
+            assert(new_router(use_case))
+          end)
+        end)
       end
 
       describe("normalization stopgap measurements", function()
@@ -3067,6 +3100,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
       local function mock_ngx(method, request_uri, headers)
         local _ngx
         _ngx = {
+          log = ngx.log,
           re = ngx.re,
           var = setmetatable({
             request_uri = request_uri,
@@ -4128,6 +4162,37 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
         assert.is_nil(match_t.upstream_host) -- only when `preserve_host = true`
         assert.equal([[/123"]], match_t.upstream_uri)
       end)
+
+      if flavor == "traditional_compatible" or flavor == "expressions" then
+        it("gracefully handles invalid utf-8 sequences", function()
+          local use_case_routes = {
+            {
+              service    = {
+                name     = "service-invalid",
+                host     = "example.org",
+                protocol = "http"
+              },
+              route      = {
+                id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+                paths    = { [[/hello]] },
+              },
+            },
+          }
+
+          local router = assert(new_router(use_case_routes))
+          local _ngx = mock_ngx("GET", "\xfc\x80\x80\x80\x80\xaf", { host = "example.org" })
+          local log_spy = spy.on(_ngx, "log")
+
+          router._set_ngx(_ngx)
+
+          local match_t = router:exec()
+          assert.is_nil(match_t)
+
+          assert.spy(log_spy).was.called_with(ngx.ERR, "router returned an error: ",
+                                              "invalid utf-8 sequence of 1 bytes from index 0",
+                                              ", 404 Not Found will be returned for the current request")
+        end)
+      end
     end)
 
 

@@ -14,6 +14,8 @@ plugins = bundled
 port_maps = NONE
 host_ports = NONE
 anonymous_reports = on
+proxy_server = NONE
+proxy_server_ssl_verify = on
 
 proxy_listen = 0.0.0.0:8000 reuseport backlog=16384, 0.0.0.0:8443 http2 ssl reuseport backlog=16384
 stream_listen = off
@@ -29,6 +31,7 @@ cluster_server_name = NONE
 cluster_data_plane_purge_delay = 1209600
 cluster_ocsp = off
 cluster_max_payload = 4194304
+cluster_use_proxy = off
 
 lmdb_environment_path = dbless.lmdb
 lmdb_map_size = 128m
@@ -82,6 +85,7 @@ nginx_proxy_real_ip_recursive = off
 nginx_admin_client_max_body_size = 10m
 nginx_admin_client_body_buffer_size = 10m
 nginx_http_lua_regex_match_limit = 100000
+nginx_http_lua_regex_cache_max_entries = 8192
 
 client_body_buffer_size = 8k
 real_ip_header = X-Real-IP
@@ -100,6 +104,9 @@ pg_ssl = off
 pg_ssl_verify = off
 pg_max_concurrent_queries = 0
 pg_semaphore_timeout = 60000
+pg_keepalive_timeout = NONE
+pg_pool_size = NONE
+pg_backlog = NONE
 
 pg_ro_host = NONE
 pg_ro_port = NONE
@@ -112,6 +119,9 @@ pg_ro_ssl = NONE
 pg_ro_ssl_verify = NONE
 pg_ro_max_concurrent_queries = NONE
 pg_ro_semaphore_timeout = NONE
+pg_ro_keepalive_timeout = NONE
+pg_ro_pool_size = NONE
+pg_ro_backlog = NONE
 
 cassandra_contact_points = 127.0.0.1
 cassandra_port = 9042
@@ -172,7 +182,6 @@ untrusted_lua_sandbox_requires =
 untrusted_lua_sandbox_environment =
 
 legacy_worker_events = off
-legacy_hybrid_protocol = off
 
 openresty_path =
 
